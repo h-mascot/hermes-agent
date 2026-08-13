@@ -22,6 +22,7 @@ import { useI18n } from '@/i18n'
 import { desktopGit } from '@/lib/desktop-git'
 import { cn } from '@/lib/utils'
 import {
+  $sidebarCardRows,
   $sidebarFiltersActive,
   $sidebarGrouping,
   $sidebarOrdering,
@@ -34,6 +35,7 @@ import {
   $sidebarViewCustomized,
   $sidebarWorkspaceNodeOpen,
   resetSidebarView,
+  setSidebarCardRows,
   setSidebarGrouping,
   setSidebarOrdering,
   setSidebarShowArchived,
@@ -150,6 +152,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
   const grouping = useStore($sidebarGrouping)
   const ordering = useStore($sidebarOrdering)
   const rowMeta = useStore($sidebarRowMeta)
+  const cardRows = useStore($sidebarCardRows)
   const statusFilter = useStore($sidebarStatusFilter)
   const projectFilter = useStore($sidebarProjectFilter)
   const profileFilter = useStore($sidebarProfileFilter)
@@ -263,6 +266,14 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
               ))}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+
+          {/* A render variant, not a grouping: three-line cards (project · age /
+              title / model · size) compose with whichever grouping is active. */}
+          <OptionCheckbox
+            checked={cardRows}
+            onCheck={() => setSidebarCardRows(!cardRows)}
+            option={{ icon: 'inbox', id: 'card-rows', label: 'Inbox style' }}
+          />
         </DropdownMenuGroup>
 
         <DropdownMenuSeparator />
