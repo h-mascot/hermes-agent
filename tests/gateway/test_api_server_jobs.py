@@ -659,3 +659,52 @@ class TestPausedExecutionBoundary:
             assert cancel.status == 200
             assert (await cancel.json())["outcome"] == "completed"
 
+    @pytest.mark.asyncio
+    async def test_execute_precheck_to_insert_race_cannot_admit_both(
+            self, adapter, monkeypatch, tmp_path):
+        """Synchronized precheck-to-insert race: a standard execution claimed in the window
+        after the advisory ``has_active_execution`` precheck must NOT be overridden by a
+        paused admission — the ledger transaction itself rejects, leaving exactly one
+        active row (the standard one)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import gateway.platforms.api_server_cron_execution as cron_execution
+        from cron import executions as ledger
+        from cron.executions import list_executions
+        from cron.jobs import create_job, pause_job
+
+        job = create_job(prompt="x", schedule="every 5m")
+        pause_job(job["id"])
+        real_precheck = cron_execution.has_active_execution
+        injected = {"done": False}
+
+        def racing_precheck(job_id):
+            result = real_precheck(job_id)
+            if not injected["done"]:
+                injected["done"] = True
+                # The racing standard claim lands AFTER the advisory precheck resolved
+                # False — exactly the reviewed defect window.
+                ledger.create_execution(job_id, source="builtin")
+            return result
+
+        monkeypatch.setattr(cron_execution, "has_active_execution", racing_precheck)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # Digest computed directly (not via the capability GET) so the POST below is the
+            # first — and only — advisory precheck call: the injection lands in the exact
+            # precheck-to-insert window of handle_execute.
+            from cron.jobs import get_job
+            response = await cli.post(
+                f"/api/jobs/{job['id']}/executions",
+                json={
+                    "occurrence_key": "race",
+                    "expected_snapshot_sha256": cron_execution._digest(get_job(job["id"])),
+                })
+            assert response.status == 409
+            assert "execution is already active" in (await response.json())["error"]
+
+        rows = list_executions(job_id=job["id"])
+        active = [row for row in rows if row["status"] in ("claimed", "running")]
+        assert len(active) == 1
+        assert active[0]["execution_kind"] == "standard"
+        assert [row for row in rows if row.get("execution_kind") == "paused_snapshot"] == []
+

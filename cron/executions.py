@@ -105,10 +105,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
+    with _lock, transaction(_connect(), immediate=immediate) as conn:
         yield conn
 
 
@@ -199,12 +199,18 @@ def create_or_replay_paused_snapshot_execution(
     Returns ``(record, replayed)``.  The caller holds the jobs fire fence while invoking this
     helper; the transaction itself is the durable idempotency boundary.  A terminal record for
     the same ``(source, job_id, occurrence_key)`` is replayed verbatim (never re-executed); a
-    different snapshot digest bound to the same key is rejected.
+    different snapshot digest bound to the same key is rejected.  Admission excludes EVERY
+    active execution for the job — standard or legacy rows included — checked inside the same
+    IMMEDIATE write transaction that inserts the claim, so a standard claim that lands after
+    the API's advisory precheck still cannot coexist with a paused one.  A DB-wide
+    ``UNIQUE(job_id) WHERE status IN ('claimed','running')`` index is deliberately NOT used:
+    standard semantics legally hold two active rows while a crashed owner awaits
+    recovery-proved invalidation, and such an index would break that reclaim.
     """
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
-    with _transaction() as conn:
+    with _transaction(immediate=True) as conn:
         existing = conn.execute(
             "SELECT * FROM executions WHERE source=? AND job_id=? AND occurrence_key=?",
             (str(source), str(job_id), str(occurrence_key)),
@@ -214,13 +220,17 @@ def create_or_replay_paused_snapshot_execution(
             if record.get("snapshot_sha256") != snapshot_sha256:
                 raise ValueError("occurrence key is already bound to a different snapshot")
             return record, True
+        # Any-kind exclusion, transaction-local: the IMMEDIATE write lock serializes this
+        # check-then-insert against every other execution writer in every process.
         active = conn.execute(
-            "SELECT id FROM executions WHERE job_id=? AND execution_kind='paused_snapshot' "
+            "SELECT execution_kind FROM executions WHERE job_id=? "
             "AND status IN ('claimed','running') LIMIT 1",
             (str(job_id),),
         ).fetchone()
         if active is not None:
-            raise RuntimeError("a paused snapshot execution is already active for this job")
+            if active[0] == "paused_snapshot":
+                raise RuntimeError("a paused snapshot execution is already active for this job")
+            raise RuntimeError("an execution is already active for this job")
         try:
             conn.execute(
                 """INSERT INTO executions

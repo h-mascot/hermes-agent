@@ -124,6 +124,121 @@ def test_error_redaction_fails_closed(monkeypatch):
     assert receipt["error"] == "[redacted error unavailable]"
 
 
+# --- exact-review repair: any-active admission exclusion inside the ledger transaction -----
+
+
+def test_standard_claimed_execution_blocks_paused_creation(monkeypatch, tmp_path):
+    """A standard (ledger-visible) claimed execution must block paused creation at the
+    ledger boundary itself — the API precheck is advisory only."""
+    _point(monkeypatch, tmp_path)
+    from cron.executions import (
+        create_execution, create_or_replay_paused_snapshot_execution,
+        get_paused_snapshot_occurrence, has_active_paused_snapshot)
+
+    create_execution("job", source="builtin")
+    try:
+        create_or_replay_paused_snapshot_execution(
+            "job", occurrence_key="occ", snapshot_sha256="a" * 64)
+    except RuntimeError as exc:
+        assert "an execution is already active" in str(exc)
+    else:
+        raise AssertionError("paused creation crossed an active standard execution")
+    assert get_paused_snapshot_occurrence("job", "occ") is None
+    assert has_active_paused_snapshot("job") is False
+
+
+def test_running_legacy_execution_blocks_paused_creation(monkeypatch, tmp_path):
+    """Any-kind active (a running legacy/standard row) blocks paused creation, while the
+    historical standard-execution concurrency — a second standard claim while another
+    standard row is still active (crashed owner awaiting recovery) — stays legal.  That
+    legality is exactly why a DB-wide active-unique index is unsafe here."""
+    _point(monkeypatch, tmp_path)
+    from cron.executions import (
+        create_execution, create_or_replay_paused_snapshot_execution,
+        mark_execution_running)
+
+    first = create_execution("job", source="builtin")
+    assert mark_execution_running(first["id"]) is not None
+    try:
+        create_or_replay_paused_snapshot_execution(
+            "job", occurrence_key="occ", snapshot_sha256="b" * 64)
+    except RuntimeError as exc:
+        assert "an execution is already active" in str(exc)
+    else:
+        raise AssertionError("paused creation crossed a running legacy execution")
+    # Standard reclaim semantics are untouched: another standard claim is still admitted.
+    second = create_execution("job", source="builtin")
+    assert second["status"] == "claimed"
+
+
+def test_failed_paused_claim_rolls_back_completely(monkeypatch, tmp_path):
+    """A rejected paused claim must leave no partial row behind — and once the blocking
+    standard execution terminalizes, the very same occurrence key must be claimable."""
+    _point(monkeypatch, tmp_path)
+    from cron.executions import (
+        create_execution, create_or_replay_paused_snapshot_execution, finish_execution,
+        get_paused_snapshot_occurrence, has_active_paused_snapshot, list_executions)
+
+    standard = create_execution("job", source="builtin")
+    with __import__("pytest").raises(RuntimeError):
+        create_or_replay_paused_snapshot_execution(
+            "job", occurrence_key="occ", snapshot_sha256="c" * 64)
+    assert get_paused_snapshot_occurrence("job", "occ") is None
+    assert has_active_paused_snapshot("job") is False
+    assert [row for row in list_executions(job_id="job")
+            if row.get("execution_kind") == "paused_snapshot"] == []
+
+    assert finish_execution(standard["id"], success=True) is not None
+    row, replayed = create_or_replay_paused_snapshot_execution(
+        "job", occurrence_key="occ", snapshot_sha256="c" * 64)
+    assert replayed is False and row["status"] == "claimed"
+
+
+def test_terminal_prior_rows_do_not_block_new_occurrence(monkeypatch, tmp_path):
+    """Only active rows exclude admission: terminal standard history and terminal paused
+    tombstones (other keys) leave a fresh occurrence claim valid."""
+    _point(monkeypatch, tmp_path)
+    from cron.executions import (
+        create_execution, create_or_replay_paused_snapshot_execution, finish_execution,
+        mark_execution_running)
+
+    done = create_execution("job", source="builtin")
+    mark_execution_running(done["id"])
+    finish_execution(done["id"], success=False, error="boom")
+    tomb, _ = create_or_replay_paused_snapshot_execution(
+        "job", occurrence_key="old", snapshot_sha256="d" * 64)
+    finish_execution(tomb["id"], success=True)
+
+    fresh, replayed = create_or_replay_paused_snapshot_execution(
+        "job", occurrence_key="new", snapshot_sha256="e" * 64)
+    assert replayed is False and fresh["status"] == "claimed"
+
+
+def test_occurrence_replay_is_idempotent_over_legacy_active_row(monkeypatch, tmp_path):
+    """Replaying an already-claimed occurrence is a pure durable read: it stays idempotent
+    even when a legacy active standard row coexists on disk (a DB written before the mutual
+    guards existed must not wedge idempotent replay)."""
+    _point(monkeypatch, tmp_path)
+    from cron.executions import (
+        _transaction, create_or_replay_paused_snapshot_execution,
+        get_paused_snapshot_occurrence)
+
+    row, _ = create_or_replay_paused_snapshot_execution(
+        "job", occurrence_key="occ", snapshot_sha256="f" * 64)
+    # Legacy on-disk state: an active standard row the guards never saw (pre-upgrade DB).
+    with _transaction() as conn:
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, execution_kind)
+               VALUES ('legacy', 'job', 'builtin', 'gone', 0, 'claimed', ?, 'standard')""",
+            (row["claimed_at"],))
+
+    same, replayed = create_or_replay_paused_snapshot_execution(
+        "job", occurrence_key="occ", snapshot_sha256="f" * 64)
+    assert replayed is True and same["id"] == row["id"]
+    assert get_paused_snapshot_occurrence("job", "occ")["id"] == row["id"]
+
+
 # --- focused forward-port regressions (current-main seams) -------------------------------------
 
 
