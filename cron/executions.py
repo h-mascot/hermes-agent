@@ -164,13 +164,20 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Persist a claimed attempt before executor/provider dispatch."""
+    """Persist a claimed attempt before executor/provider dispatch.
+
+    Runs on the same IMMEDIATE write boundary as paused admission: the paused-active guard
+    and the INSERT serialize against every other execution writer (a deferred transaction
+    could read the guard before a concurrent paused commit and insert after it, admitting
+    both classes at once). Standard-vs-standard concurrency is untouched — only an active
+    paused snapshot excludes a standard claim.
+    """
     from cron.occurrences import scheduled_instant as canonical_instant
 
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
-    with _transaction() as conn:
+    with _transaction(immediate=True) as conn:
         active_snapshot = conn.execute(
             "SELECT 1 FROM executions WHERE job_id=? AND execution_kind='paused_snapshot' "
             "AND status IN ('claimed','running') LIMIT 1", (str(job_id),)
