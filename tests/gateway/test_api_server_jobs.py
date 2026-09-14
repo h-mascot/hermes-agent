@@ -10,6 +10,7 @@ Covers:
 - Cron module unavailability (501 when _CRON_AVAILABLE is False)
 """
 
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -63,6 +64,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/jobs/{job_id}/pause", adapter._handle_pause_job)
     app.router.add_post("/api/jobs/{job_id}/resume", adapter._handle_resume_job)
     app.router.add_post("/api/jobs/{job_id}/run", adapter._handle_run_job)
+    app.router.add_get("/api/jobs/{job_id}/execution-capability", adapter._handle_execution_capability)
+    app.router.add_post("/api/jobs/{job_id}/executions", adapter._handle_execution_create)
+    app.router.add_get("/api/jobs/{job_id}/executions/{execution_id}", adapter._handle_execution_status)
+    app.router.add_post("/api/jobs/{job_id}/executions/{execution_id}/cancel", adapter._handle_execution_cancel)
     return app
 
 
@@ -556,4 +561,101 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
+
+
+class TestPausedExecutionBoundary:
+    @pytest.mark.asyncio
+    async def test_capability_reports_digest_for_paused_job(self, adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from cron.jobs import create_job, pause_job
+
+        job = create_job(prompt="x", schedule="every 5m")
+        pause_job(job["id"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(f"/api/jobs/{job['id']}/execution-capability")
+            assert response.status == 200
+            data = await response.json()
+            assert data["supported"] is True
+            assert data["eligible"] is True
+            assert len(data["snapshot_sha256"]) == 64
+
+    @pytest.mark.asyncio
+    async def test_capability_requires_auth(self, auth_adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get(f"/api/jobs/{VALID_JOB_ID}/execution-capability")
+            assert response.status == 401
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_digest_mismatch(self, adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from cron.jobs import create_job, pause_job
+
+        job = create_job(prompt="x", schedule="every 5m")
+        pause_job(job["id"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/api/jobs/{job['id']}/executions",
+                json={"occurrence_key": "occ", "expected_snapshot_sha256": "a" * 64})
+            assert response.status == 412
+            assert "digest mismatch" in (await response.json())["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_replay_and_result_and_cancel_roundtrip(
+            self, adapter, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import gateway.platforms.api_server_cron_execution as cron_execution
+        from cron.executions import finish_execution
+        from cron.jobs import create_job, pause_job
+
+        def _fake_run_snapshot(job, adapters, loop):
+            finish_execution(job["execution_id"], success=True)
+            return True
+
+        monkeypatch.setattr(cron_execution, "_run_snapshot", _fake_run_snapshot)
+        job = create_job(prompt="x", schedule="every 5m")
+        pause_job(job["id"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            capability = await (await cli.get(
+                f"/api/jobs/{job['id']}/execution-capability")).json()
+            body = {
+                "occurrence_key": "roundtrip",
+                "expected_snapshot_sha256": capability["snapshot_sha256"],
+            }
+            created = await cli.post(f"/api/jobs/{job['id']}/executions", json=body)
+            assert created.status == 202
+            execution_id = (await created.json())["execution_id"]
+            # Same key + same digest replays the exact occurrence (no second run).
+            replay = await cli.post(f"/api/jobs/{job['id']}/executions", json=body)
+            assert replay.status == 200
+            replay_data = await replay.json()
+            assert replay_data["replayed"] is True
+            assert replay_data["execution_id"] == execution_id
+            # A different digest bound to the same key is refused.
+            rebound = await cli.post(
+                f"/api/jobs/{job['id']}/executions",
+                json={"occurrence_key": "roundtrip", "expected_snapshot_sha256": "b" * 64})
+            assert rebound.status == 409
+            # Exact authenticated result GET (bounded wait: the detached worker
+            # terminalizes the attempt from a background thread).
+            status_data = {"status": None}
+            for _ in range(100):
+                status = await cli.get(f"/api/jobs/{job['id']}/executions/{execution_id}")
+                assert status.status == 200
+                status_data = await status.json()
+                if status_data["status"] in {"completed", "failed", "unknown"}:
+                    break
+                await asyncio.sleep(0.05)
+            assert status_data["status"] == "completed"
+            # A foreign execution id under this job is not found.
+            foreign = await cli.get(f"/api/jobs/{job['id']}/executions/ffffffffffffffff")
+            assert foreign.status == 404
+            # Cancel on a terminal attempt is honest: 200, not newly cancelled.
+            cancel = await cli.post(f"/api/jobs/{job['id']}/executions/{execution_id}/cancel")
+            assert cancel.status == 200
+            assert (await cancel.json())["outcome"] == "completed"
 

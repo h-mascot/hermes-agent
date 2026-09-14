@@ -1736,9 +1736,21 @@ def _deliver_result(
 
         _record_delivery_verification(job, [])
         error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure)
+        # A paused-source worker cannot mutate jobs.json while its execution is active.  Read the
+        # durable queue state directly so pending delivery is never misclassified as delivered.
+        if not error and not job.get("last_delivery_queued"):
+            _queued_status = None
+            with contextlib.suppress(Exception):
+                from cron.delivery_queue import get_status as _get_delivery_status
+                queued = _get_delivery_status(external_execution)
+                _queued_status = queued.get("status") if queued else None
+            if _queued_status in {None, "pending", "delivering"}:
+                job["last_delivery_queued"] = {
+                    str(external_execution): {"status": "queued"}}
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
-        job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+        if refreshed.get("last_delivery_queued"):
+            job["last_delivery_queued"] = refreshed["last_delivery_queued"]
         return error
 
     from gateway.config import load_gateway_config

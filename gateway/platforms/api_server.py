@@ -1042,6 +1042,8 @@ except ImportError:
     class _CronSchedulerRegistrationError(RuntimeError):
         pass
 
+from gateway.platforms import api_server_cron_execution as _cron_execution_api
+
 
 def _notify_cron_provider_jobs_changed() -> None:
     """Best-effort notify of the active cron provider after a REST mutation (built-in: no-op)."""
@@ -1570,7 +1572,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
-            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/api/jobs/{job_id}/execution-capability", self._handle_execution_capability),
+            ("POST", "/api/jobs/{job_id}/executions", self._handle_execution_create),
+            ("GET", "/api/jobs/{job_id}/executions/{execution_id}", self._handle_execution_status),
+            ("POST", "/api/jobs/{job_id}/executions/{execution_id}/cancel", self._handle_execution_cancel)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
@@ -3481,6 +3487,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 extra_prompt = extra_prompt or None
         return self._job_response(
             lambda jid: _cron_trigger(jid, extra_prompt=extra_prompt), job_id, notify=False)
+
+    async def _handle_execution_capability(self, request: "web.Request") -> "web.Response":
+        return await _cron_execution_api.handle_capability(self, request)
+
+    async def _handle_execution_create(self, request: "web.Request") -> "web.Response":
+        return await _cron_execution_api.handle_execute(self, request)
+
+    async def _handle_execution_status(self, request: "web.Request") -> "web.Response":
+        return await _cron_execution_api.handle_status(self, request)
+
+    async def _handle_execution_cancel(self, request: "web.Request") -> "web.Response":
+        return await _cron_execution_api.handle_cancel(self, request)
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
         """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a

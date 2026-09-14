@@ -82,9 +82,25 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    add_column_if_missing(conn, "executions", "occurrence_key", "occurrence_key TEXT")
+    add_column_if_missing(conn, "executions", "snapshot_sha256", "snapshot_sha256 TEXT")
+    add_column_if_missing(
+        conn, "executions", "execution_kind",
+        "execution_kind TEXT NOT NULL DEFAULT 'standard'",
+    )
+    add_column_if_missing(conn, "executions", "cancel_requested_at", "cancel_requested_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_occurrence_key "
+        "ON executions(source, job_id, occurrence_key) WHERE occurrence_key IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_paused_active_job "
+        "ON executions(job_id) WHERE execution_kind='paused_snapshot' "
+        "AND status IN ('claimed','running')"
     )
 
 
@@ -138,7 +154,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','unknown') AND occurrence_key IS NULL
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
@@ -155,6 +171,12 @@ def create_execution(
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
+        active_snapshot = conn.execute(
+            "SELECT 1 FROM executions WHERE job_id=? AND execution_kind='paused_snapshot' "
+            "AND status IN ('claimed','running') LIMIT 1", (str(job_id),)
+        ).fetchone()
+        if active_snapshot is not None:
+            raise RuntimeError("a paused snapshot execution is already active for this job")
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
@@ -166,6 +188,131 @@ def create_execution(
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
+
+
+def create_or_replay_paused_snapshot_execution(
+    job_id: str, *, occurrence_key: str, snapshot_sha256: str,
+    source: str = "api_server",
+) -> tuple[Dict[str, Any], bool]:
+    """Atomically claim one immutable paused-source occurrence.
+
+    Returns ``(record, replayed)``.  The caller holds the jobs fire fence while invoking this
+    helper; the transaction itself is the durable idempotency boundary.  A terminal record for
+    the same ``(source, job_id, occurrence_key)`` is replayed verbatim (never re-executed); a
+    different snapshot digest bound to the same key is rejected.
+    """
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _transaction() as conn:
+        existing = conn.execute(
+            "SELECT * FROM executions WHERE source=? AND job_id=? AND occurrence_key=?",
+            (str(source), str(job_id), str(occurrence_key)),
+        ).fetchone()
+        if existing is not None:
+            record = dict(existing)
+            if record.get("snapshot_sha256") != snapshot_sha256:
+                raise ValueError("occurrence key is already bound to a different snapshot")
+            return record, True
+        active = conn.execute(
+            "SELECT id FROM executions WHERE job_id=? AND execution_kind='paused_snapshot' "
+            "AND status IN ('claimed','running') LIMIT 1",
+            (str(job_id),),
+        ).fetchone()
+        if active is not None:
+            raise RuntimeError("a paused snapshot execution is already active for this job")
+        try:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at, status,
+                    claimed_at, occurrence_key, snapshot_sha256, execution_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, 'paused_snapshot')""",
+                (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+                 _process_start_time(pid), now, str(occurrence_key), snapshot_sha256),
+            )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT * FROM executions WHERE source=? AND job_id=? AND occurrence_key=?",
+                (str(source), str(job_id), str(occurrence_key)),
+            ).fetchone()
+            if existing is None:
+                raise
+            record = dict(existing)
+            if record.get("snapshot_sha256") != snapshot_sha256:
+                raise ValueError("occurrence key is already bound to a different snapshot")
+            return record, True
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record)
+    return record, False  # type: ignore[return-value]
+
+
+def has_active_paused_snapshot(job_id: str) -> bool:
+    with _transaction() as conn:
+        return conn.execute(
+            "SELECT 1 FROM executions WHERE job_id=? AND execution_kind='paused_snapshot' "
+            "AND status IN ('claimed','running') LIMIT 1", (str(job_id),)
+        ).fetchone() is not None
+
+
+def has_active_execution(job_id: str) -> bool:
+    """Conservative source exclusion: every claimed/running execution blocks a new snapshot."""
+    with _transaction() as conn:
+        return conn.execute(
+            "SELECT 1 FROM executions WHERE job_id=? AND status IN ('claimed','running') LIMIT 1",
+            (str(job_id),),
+        ).fetchone() is not None
+
+
+def get_paused_snapshot_occurrence(
+    job_id: str, occurrence_key: str, *, source: str = "api_server"
+) -> Optional[Dict[str, Any]]:
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE source=? AND job_id=? AND occurrence_key=?",
+            (str(source), str(job_id), str(occurrence_key)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+
+def request_execution_cancel(execution_id: str) -> tuple[Optional[Dict[str, Any]], bool]:
+    """Durably request cooperative cancellation; returns record and whether it was newly set."""
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        current = _fetch(conn, execution_id)
+        if current is None:
+            return None, False
+        if current.get("status") not in ("claimed", "running"):
+            return current, False
+        if current.get("cancel_requested_at"):
+            return current, False
+        conn.execute(
+            "UPDATE executions SET cancel_requested_at=? WHERE id=? AND status IN ('claimed','running')",
+            (now, execution_id),
+        )
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record)
+    return record, True
+
+
+def execution_cancel_requested(execution_id: str) -> bool:
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT cancel_requested_at FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+        return bool(row and row[0])
+
+
+def execution_owned_by_current_process(execution_id: str) -> bool:
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT process_id,pid,process_started_at,status FROM executions WHERE id=?",
+            (execution_id,),
+        ).fetchone()
+    if row is None or row[3] not in ("claimed", "running"):
+        return False
+    return row[0] == _PROCESS_ID and row[1] == os.getpid() and (
+        row[2] is None or row[2] == _process_start_time(os.getpid())
+    )
 
 
 def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:

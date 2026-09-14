@@ -2038,6 +2038,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
 
     def apply(jobs, i, job):
+        from cron.executions import has_active_paused_snapshot
+        if has_active_paused_snapshot(job_id):
+            raise ValueError("Cannot mutate a job while a paused snapshot execution is active")
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
         previous_inference_axes = _normalized_inference_axes(job)
@@ -2075,7 +2078,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         save_jobs(jobs)
         return _normalize_job_record(updated)
 
-    return _with_job(job_id, apply)
+    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply))
 
 
 def resnapshot_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -2259,6 +2262,9 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
         raise _oneshot_past_grace_error(parsed_schedule.get("run_at") or run_at)
 
     def apply(jobs, _i, job):
+        from cron.executions import has_active_paused_snapshot
+        if has_active_paused_snapshot(job_ref["id"]):
+            raise ValueError("Cannot re-arm a job while a paused snapshot execution is active")
         now = _hermes_now()
         if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
             raise ValueError("Cannot re-arm one-shot over a live run claim.")
@@ -2276,7 +2282,7 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
         save_jobs(jobs)
         return _normalize_job_record(job)
 
-    return _with_job(job_ref["id"], apply)
+    return _under_fire_fence(job_ref["id"], lambda: _with_job(job_ref["id"], apply))
 
 
 def remove_job(job_id: str) -> bool:
@@ -2285,30 +2291,36 @@ def remove_job(job_id: str) -> bool:
     if not job:
         return False
     canonical_id = job["id"]
-    with _jobs_lock():
-        jobs = load_jobs()
-        original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
-        if len(jobs) == original_len:
-            return False
-        # Resolve BEFORE saving so a legacy unsafe ID fails closed without a half-applied removal.
-        job_output_dir = _job_output_dir(canonical_id)
-        save_jobs(jobs, removed_ids={canonical_id})
-        marker = _self_removal_delivery.get()
-        if marker is not None and marker.job_id == canonical_id:
-            marker.removed = True
-        if job_output_dir.exists():
-            shutil.rmtree(job_output_dir)
-        try:
-            from cron.notepad import clear_notepad
-            clear_notepad(canonical_id)
-        except Exception:
-            logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
-        # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
-        _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
-        with _fire_fence_locks_guard:
-            _fire_fence_locks.pop(_fence_key, None)
-        return True
+
+    def locked():
+        from cron.executions import has_active_paused_snapshot
+        if has_active_paused_snapshot(canonical_id):
+            raise ValueError("Cannot remove a job while a paused snapshot execution is active")
+        with _jobs_lock():
+            jobs = load_jobs()
+            original_len = len(jobs)
+            jobs = [j for j in jobs if j["id"] != canonical_id]
+            if len(jobs) == original_len:
+                return False
+            # Resolve BEFORE saving so a legacy unsafe ID fails closed without a half-applied removal.
+            job_output_dir = _job_output_dir(canonical_id)
+            save_jobs(jobs, removed_ids={canonical_id})
+            marker = _self_removal_delivery.get()
+            if marker is not None and marker.job_id == canonical_id:
+                marker.removed = True
+            if job_output_dir.exists():
+                shutil.rmtree(job_output_dir)
+            try:
+                from cron.notepad import clear_notepad
+                clear_notepad(canonical_id)
+            except Exception:
+                logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
+            # Prune the fire-fence lock entry so the registry does not grow monotonically.
+            _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
+            with _fire_fence_locks_guard:
+                _fire_fence_locks.pop(_fence_key, None)
+            return True
+    return _under_fire_fence(canonical_id, locked)
 
 
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
@@ -2630,6 +2642,9 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     def apply(jobs, _i, job):
         if job.get("schedule", {}).get("kind") != "once":
             return False
+        from cron.executions import has_active_paused_snapshot
+        if has_active_paused_snapshot(job_id):
+            return False
         return _refresh_claim(jobs, job.get("run_claim"), expected_owner)
 
     return _with_job(job_id, apply, False)
@@ -2645,11 +2660,14 @@ def clear_run_claim(job_id: str) -> bool:
     def apply(jobs, _i, job):
         if job.get("schedule", {}).get("kind") != "once" or job.get("run_claim") is None:
             return False  # recurring, or already cleared
+        from cron.executions import has_active_paused_snapshot
+        if has_active_paused_snapshot(job_id):
+            return False
         job["run_claim"] = None
         save_jobs(jobs)
         return True
 
-    return _with_job(job_id, apply, False)
+    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 
 
 def advance_next_runs(job_ids) -> int:
@@ -2715,6 +2733,10 @@ def claim_job_for_fire(
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
+        from cron.executions import has_active_paused_snapshot
+        if has_active_paused_snapshot(job_id):
+            logger.info("Cron job %s has an active paused snapshot; rejecting legacy fire", job_id)
+            return False
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``

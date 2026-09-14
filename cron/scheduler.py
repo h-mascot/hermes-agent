@@ -440,7 +440,8 @@ from cron.jobs import (
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions)
+    recover_interrupted_executions, execution_cancel_requested,
+    execution_owned_by_current_process)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -526,6 +527,20 @@ class _CombinedCancelEvent:
     def set(self) -> None:
         for event in self._events:
             event.set()
+
+
+class _LedgerCancelEvent:
+    """Cross-process cancellation source for immutable API executions."""
+
+    def __init__(self, execution_id: str):
+        self.execution_id = execution_id
+
+    def is_set(self) -> bool:
+        return execution_cancel_requested(self.execution_id)
+
+    def set(self) -> None:
+        # Durable cancellation is requested by the API handler; the scheduler only observes it.
+        return None
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -2440,12 +2455,19 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+    source_immutable: bool = False,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
-    transport-level cancel (dashboard drain)."""
+    transport-level cancel (dashboard drain). ``source_immutable``: execute an immutable
+    paused-source snapshot — no jobs.json bookkeeping (``claim_dispatch``/``mark_job_run``);
+    cooperative ledger cancellation applies instead."""
+    source_immutable = bool(source_immutable or job.get("_source_immutable"))
+    if source_immutable:
+        job = dict(job)
+        job["_source_immutable"] = True
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
@@ -2466,12 +2488,13 @@ def run_one_job(
             claim = job.get("fire_claim")
             owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
             try:
-                mark_job_run(
-                    job["id"],
-                    False,
-                    error,
-                    **({"expected_fire_owner": owner} if owner else {}),
-                )
+                if not source_immutable:
+                    mark_job_run(
+                        job["id"],
+                        False,
+                        error,
+                        **({"expected_fire_owner": owner} if owner else {}),
+                    )
             finally:
                 finish_execution(execution_id, success=False, error=error)
             return True
@@ -2484,6 +2507,8 @@ def run_one_job(
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     execution_token = object()
+    if source_immutable and cancel_event is None:
+        cancel_event = _LedgerCancelEvent(execution_id)
     profile_home = _get_hermes_home().resolve()
     with _running_lock:
         _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
@@ -2500,7 +2525,7 @@ def run_one_job(
                     extra_prompt=extra_prompt,
                     fire_claim_lost=(
                         _CombinedCancelEvent(lost_ownership, cancel_event)
-                        if cancel_event is not None
+                        if (cancel_event is not None or source_immutable)
                         else lost_ownership
                     ),
                     execution_token=execution_token))
@@ -2644,6 +2669,11 @@ def _save_compose_deliver(
     """Save output, compose the notice and deliver it (both side effects run under the fire-claim
     fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the caller)."""
     job = d.job
+    immutable = bool(job.get("_source_immutable"))
+    execution_id = job.get("execution_id")
+    if immutable and (not execution_id or execution_cancel_requested(str(execution_id))
+                      or not execution_owned_by_current_process(str(execution_id))):
+        raise _FireClaimLostDuringSideEffect
     with fence.side_effect_fence() as owns_output:
         if not owns_output:
             raise _FireClaimLostDuringSideEffect
@@ -2689,7 +2719,9 @@ def _save_compose_deliver(
         logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
         d.should_deliver = False
 
-    if d.should_deliver and fence.lost():
+    if d.should_deliver and (fence.lost() or (immutable and (
+            execution_cancel_requested(str(execution_id))
+            or not execution_owned_by_current_process(str(execution_id))))):
         d.should_deliver = False
         logger.warning("Job '%s': skipping delivery after fire claim ownership loss", job["id"])
 
@@ -2713,6 +2745,14 @@ def _save_compose_deliver(
                 # on the failure path) honor the job's failure_deliver override (NS-788).
                 for_failure=not d.success,
             )
+            if immutable and d.delivery_error is None:
+                # The restart-safe queue's pending state is authoritative for an immutable source;
+                # jobs.json bookkeeping is intentionally fenced and must not be consulted.
+                with contextlib.suppress(Exception):
+                    from cron.delivery_queue import get_status as _get_delivery_status
+                    _queued = _get_delivery_status(str(execution_id))
+                    if _queued and _queued.get("status") in {"pending", "delivering"}:
+                        job["last_delivery_queued"] = {str(execution_id): {"status": "queued"}}
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise
@@ -2843,12 +2883,14 @@ def _run_one_job_body(
 
     _scope_token = None
     _terminal_scope_token = None
+    source_immutable = bool(job.get("_source_immutable"))
     try:
         # Commit a finite one-shot's dispatch BEFORE its side effect so a tick dying mid-run cannot
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
         # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
-        # fire_due) get at-most-times semantics. See #38758.
-        if not claim_dispatch(job["id"]):
+        # fire_due) get at-most-times semantics. See #38758. An immutable paused-source run owns its
+        # occurrence durably in the execution ledger and must never touch the source store.
+        if not source_immutable and not claim_dispatch(job["id"]):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]))
@@ -2863,6 +2905,9 @@ def _run_one_job_body(
         external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
         if not external_owner and mark_execution_running(execution_id) is None:
             logger.warning("Cron job %s lost execution ownership before start; skipping", job["id"])
+            return True
+        if source_immutable and execution_cancel_requested(execution_id):
+            finish_execution(execution_id, success=False, error="Execution cancelled before start")
             return True
 
         # get_secret() fails closed outside a scope; the ticker thread has none. Delivery adapters
@@ -2921,7 +2966,11 @@ def _run_one_job_body(
             _teardown_deferred()
             raise
 
-        if _fire_claim_ownership_lost():
+        if source_immutable and execution_cancel_requested(execution_id):
+            _teardown_deferred()
+            finish_execution(execution_id, success=False, error="Execution cancelled")
+            return True
+        if (source_immutable and not execution_owned_by_current_process(execution_id)) or _fire_claim_ownership_lost():
             _teardown_deferred()
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
@@ -2940,7 +2989,11 @@ def _run_one_job_body(
             # Every path must tear down deferred agent(s) so they never leak subprocesses/clients.
             _teardown_deferred()
 
-        if d.side_effect_ownership_lost or _fire_claim_ownership_lost():
+        if d.side_effect_ownership_lost or _fire_claim_ownership_lost() or (
+                source_immutable and execution_cancel_requested(execution_id)):
+            if source_immutable and execution_cancel_requested(execution_id):
+                finish_execution(execution_id, success=False, error="Execution cancelled")
+                return True
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
@@ -2953,6 +3006,17 @@ def _run_one_job_body(
             _finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
+        if source_immutable:
+            finish_execution(execution_id, success=d.success, error=d.error,
+                             delivery_outcome=_classify_delivery_outcome(
+                                 delivery_error=d.delivery_error,
+                                 delivery_queued=job.get("last_delivery_queued"),
+                                 should_deliver=d.should_deliver,
+                                 unresolved_origin=d.unresolved_origin,
+                                 normalized_deliver=_normalize_deliver_value(
+                                     _delivery_lane_value(job, for_failure=not d.success)),
+                                 incident_acked=d.incident_acked, success=d.success))
+            return True
         return _finish_completed_run(d, fire_owner, execution_id)
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
@@ -2994,7 +3058,8 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
-                mark_job_run(job["id"], False, _err_text, **mark_kwargs)
+                if not source_immutable:
+                    mark_job_run(job["id"], False, _err_text, **mark_kwargs)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
@@ -3362,7 +3427,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                return run_one_job(job, adapters=None, loop=None, verbose=False)
+                return run_one_job(
+                    job, adapters=None, loop=None, verbose=False,
+                    source_immutable=bool(job.get("_source_immutable")))
             finally:
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)
