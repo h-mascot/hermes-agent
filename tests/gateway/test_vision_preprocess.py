@@ -29,6 +29,11 @@ async def test_enrich_message_with_vision_uses_concise_prompt():
         in mock_vision.await_args.kwargs["user_prompt"]
     )
     assert "Skip decorative details." in mock_vision.await_args.kwargs["user_prompt"]
+    # The caption prompt must not lead with a non-English length hint (it biased
+    # vision descriptions — and then replies — into Chinese) and must pin the
+    # response language to English regardless of image content.
+    assert "Chinese characters" not in mock_vision.await_args.kwargs["user_prompt"]
+    assert "Always respond in English" in mock_vision.await_args.kwargs["user_prompt"]
     # No output cap is forwarded: per the max-tokens-knob policy the aux
     # client decides token handling; conciseness comes from the prompt.
     assert "max_tokens" not in mock_vision.await_args.kwargs

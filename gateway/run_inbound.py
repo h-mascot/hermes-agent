@@ -1935,10 +1935,11 @@ class GatewayInboundMixin:
 
         analysis_prompt = (
             "Concisely describe this image in 2-4 sentences "
-            "(~200 Chinese characters or ~150 English words). "
+            "(~150 English words). "
             "Cover the main subject, key visible text/data/code, and overall context. "
             "If it is a chart, diagram, or scientific figure, include the important "
-            "labels, legend, and key values. Skip decorative details."
+            "labels, legend, and key values. Skip decorative details. "
+            "Always respond in English regardless of the language visible in the image."
         )
         enriched_parts = []
         for path in image_paths:
